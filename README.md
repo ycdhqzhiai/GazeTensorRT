@@ -25,7 +25,7 @@ make -j4
 
 | 框架(GTX3090)                             | inference(ms)  |
 | ------------------------------------ | ----- |
-| tensorrt                              | 1.1 |
+| tensorrt                              |0.47 |
 | torch                              | 13.7 |
 | onnxruntime | 3.8~270(不知道为什么) |
 
