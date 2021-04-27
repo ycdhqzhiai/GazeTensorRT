@@ -1,10 +1,22 @@
 #ifndef GAZE_COMMON_H_
 #define GAZE_COMMON_H_
 
+#include <opencv2/opencv.hpp>
 #include <math.h>
+#include <dirent.h>
 #include "NvInfer.h"
 using namespace nvinfer1;
 
+#define CHECK(status) \
+    do\
+    {\
+        auto ret = (status);\
+        if (ret != 0)\
+        {\
+            std::cerr << "Cuda failure: " << ret << std::endl;\
+            abort();\
+        }\
+    } while (0)
 static inline std::map<std::string, Weights> loadWeights(const std::string &wts_file)
 {
     std::cout << "Loading Weights: " << wts_file << std::endl;

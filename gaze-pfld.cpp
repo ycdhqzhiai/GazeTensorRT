@@ -10,10 +10,13 @@
 
 static const int INPUT_H = 112;
 static const int INPUT_W = 160;
+static const int INPUT_C = 3;
 
+static const int OUTPUT1_SIZE = 102;
+static const int OUTPUT2_SIZE = 2;
 const char* INPUT_BLOB_NAME = "images";
-const char* LANDMARKOUT_BLOB_NAME = "landmark_output";
-const char* GAZEOUT_BLOB_NAME = "gaze_output";
+const char* OUTPUT_BLOB_NAME_landmarks = "landmark_output";
+const char* OUTPUT_BLOB_NAME_gaze = "gaze_output";
 
 using namespace nvinfer1;
 static Logger gLogger;
@@ -162,7 +165,7 @@ ICudaEngine* createEngine(unsigned int maxBatchSize, IBuilder* builder, IBuilder
     IShuffleLayer* cat2 = network->addShuffle(*cat1->getOutput(0));
     assert(cat2);
     cat2->setSecondTranspose(Permutation{1, 0});
-#if 1
+#if 0
     Dims dims = cat2->getOutput(0)->getDimensions();
     std::cout <<"multi_scale dims "<< dims.nbDims<<std::endl;
     //std::cout << avg_pool1->getOutput(0)->getName() << " dims: ";
@@ -210,7 +213,7 @@ ICudaEngine* createEngine(unsigned int maxBatchSize, IBuilder* builder, IBuilder
 
     auto gaze = network->addElementWise(*matrixMultLayer3->getOutput(0), *fcbias3->getOutput(0), nvinfer1::ElementWiseOperation::kSUM);
     assert(gaze != nullptr);
-#if 1
+#if 0
     Dims dims1 = gaze->getOutput(0)->getDimensions();
     std::cout <<"gaze dims "<< dims1.nbDims<<std::endl;
     //std::cout << avg_pool1->getOutput(0)->getName() << " dims: ";
@@ -218,10 +221,10 @@ ICudaEngine* createEngine(unsigned int maxBatchSize, IBuilder* builder, IBuilder
         std::cout << dims1.d[i] << std::endl;;
     }
 #endif
-    landmarks->getOutput(0)->setName(LANDMARKOUT_BLOB_NAME);
+    landmarks->getOutput(0)->setName(OUTPUT_BLOB_NAME_landmarks);
     network->markOutput(*landmarks->getOutput(0));
 
-    gaze->getOutput(0)->setName(GAZEOUT_BLOB_NAME);
+    gaze->getOutput(0)->setName(OUTPUT_BLOB_NAME_gaze);
     network->markOutput(*gaze->getOutput(0));
 
     // Build engine
@@ -268,6 +271,43 @@ void APIToModel(unsigned int maxBatchSize, IHostMemory ** modelStream)
     builder->destroy();
 }
 
+
+void doInference(IExecutionContext& context, float* input, float* output1, float* output2, int batchSize)
+{
+    const ICudaEngine& engine = context.getEngine();
+    //std::cout << engine.getNbBindings() << std::endl;
+    assert(engine.getNbBindings() == 3);
+    void* buffers[3];
+    // In order to bind the buffers, we need to know the names of the input and output tensors.
+    // Note that indices are guaranteed to be less than IEngine::getNbBindings()
+    const int inputIndex = engine.getBindingIndex(INPUT_BLOB_NAME);
+    const int outputIndex_landmarks = engine.getBindingIndex(OUTPUT_BLOB_NAME_landmarks);
+    const int outputIndex_gaze = engine.getBindingIndex(OUTPUT_BLOB_NAME_gaze);
+
+    // Create GPU buffers on device
+    CHECK(cudaMalloc(&buffers[inputIndex], batchSize * 3 * INPUT_H * INPUT_W * sizeof(float)));
+    CHECK(cudaMalloc(&buffers[outputIndex_landmarks], batchSize * OUTPUT1_SIZE * sizeof(float)));
+    CHECK(cudaMalloc(&buffers[outputIndex_gaze], batchSize * OUTPUT2_SIZE * sizeof(float)));
+
+    // Create stream
+    cudaStream_t stream;
+    CHECK(cudaStreamCreate(&stream));
+
+    // DMA input batch data to device, infer on the batch asynchronously, and DMA output back to host
+    CHECK(cudaMemcpyAsync(buffers[inputIndex], input, batchSize * 3 * INPUT_H * INPUT_W * sizeof(float), cudaMemcpyHostToDevice, stream));
+    context.enqueue(batchSize, buffers, stream, nullptr);
+    CHECK(cudaMemcpyAsync(output1, buffers[outputIndex_landmarks], batchSize * OUTPUT1_SIZE * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CHECK(cudaMemcpyAsync(output2, buffers[outputIndex_gaze], batchSize * OUTPUT2_SIZE * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    cudaStreamSynchronize(stream);
+
+    // Release stream and buffers
+    cudaStreamDestroy(stream);
+    CHECK(cudaFree(buffers[inputIndex]));
+    CHECK(cudaFree(buffers[outputIndex_landmarks]));
+    CHECK(cudaFree(buffers[outputIndex_gaze]));
+}
+
+
 int main(int argc, char** argv)
 {
     if (argc !=2)
@@ -287,7 +327,7 @@ int main(int argc, char** argv)
         APIToModel(BATCH_SIZE, &modelStream);
         assert(modelStream != nullptr);
 
-        std::ofstream engine_files("gaze_pfld.engine", std::ios::binary);
+        std::ofstream engine_files("gaze-pfld.engine", std::ios::binary);
         if (!engine_files)
         {
             std::cerr << "could not open plan output file" << std::endl;
@@ -297,5 +337,92 @@ int main(int argc, char** argv)
         modelStream->destroy();
         return 1;
     }
+    else if (std::string(argv[1]) == "-d")
+    {
+        std::ifstream engine_files("gaze-pfld.engine", std::ios::binary);
+        if (engine_files.good())
+        {
+            engine_files.seekg(0, engine_files.end);
+            size = engine_files.tellg();
+            engine_files.seekg(0, engine_files.beg);
+            trtModelStream = new char[size];
+            assert(trtModelStream);
+            engine_files.read(trtModelStream, size);
+            engine_files.close();
+        }
+        else
+        {
+            std::cerr << "read engine files error.please ./gaze-pfld -s" << std::endl;
+            return -1;
+        }
+    }
+    else
+    {
+            std::cerr << "arguments not right!" << std::endl;
+            std::cerr << "./gaze-pfld -s  // serialize model to plan file" << std::endl;
+            std::cerr << "./gaze-pfld -d  // deserialize plan file and run inference" << std::endl;
+            return -1;
+    }
+
+    /* prepare input data */
+    static float data[BATCH_SIZE * 3 *INPUT_W * INPUT_H];
+
+    cv::Mat input_img = cv::imread("../pre_img.png");
+    cv::Mat src_img = input_img.clone();
+    cv::resize(input_img, input_img, cv::Size(INPUT_W, INPUT_H), 0, 0, cv::INTER_LINEAR);
+
+    for (int b = 0; b < BATCH_SIZE; b++)
+    {
+        float* input_data = &data[b * 3 * INPUT_H * INPUT_W];
+        for (int i = 0; i < INPUT_H * INPUT_W; i++)
+        {
+            input_data[i] = input_img.at<cv::Vec3b>(i)[0] / 255.0;
+            input_data[i + INPUT_H * INPUT_W] = input_img.at<cv::Vec3b>(i)[1] / 255.0;
+            input_data[i + 2 * INPUT_H * INPUT_W] = input_img.at<cv::Vec3b>(i)[2] / 255.0;
+        }
+    }
+
+#if 0 //debug
+    for (int i = 0; i < 3 * INPUT_H * INPUT_W; i++)
+    {
+        std::cout << data[i] << std::endl;
+    }
+#endif
+    IRuntime* runtime = createInferRuntime(gLogger);
+    assert(runtime != nullptr);
+    ICudaEngine* engine = runtime->deserializeCudaEngine(trtModelStream, size);
+    assert(engine != nullptr);
+    IExecutionContext* context = engine->createExecutionContext();
+    assert(context != nullptr);
+
+    // Run inference
+    static float out1[BATCH_SIZE * OUTPUT1_SIZE];
+    static float out2[BATCH_SIZE * OUTPUT2_SIZE];
+    for (int cc = 0; cc < 1000; cc++) {
+        auto start = std::chrono::system_clock::now();
+        doInference(*context, data, out1, out2, BATCH_SIZE);
+        auto end = std::chrono::system_clock::now();
+        std::cout << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << "us" << std::endl;
+    }
+
+    for (int b = 0; b < BATCH_SIZE; b++)
+    {
+        for(int j = 0; j < OUTPUT1_SIZE / 2; j++)
+        {
+            float x = out1[2*j] * src_img.cols;
+            float y = out1[2*j + 1] * src_img.rows;
+            std::cout << out1[2*j] << std::endl;
+            std::cout << out1[2*j + 1] << std::endl;
+            cv::circle(src_img, cv::Point(x, y), 2, cv::Scalar(0,0,255), -1);
+        }
+        cv::line(src_img, cv::Size(int(out1[100] * src_img.cols), int(out1[101] * src_img.rows)), cv::Size(int(out1[100] * src_img.cols + out2[0] * 400), int(out1[101] * src_img.rows + out2[1] * 400)), cv::Scalar(0, 255, 0), 2);
+        cv::imshow("result", src_img);
+        cv::imwrite("result.jpg", src_img);
+        cv::waitKey(0);
+    }
+    // Destroy the engine
+    context->destroy();
+    engine->destroy();
+    runtime->destroy();
     return 0;
 }
