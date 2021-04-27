@@ -29,7 +29,7 @@ make -j4
 | torch                              | 13.7 |
 | onnxruntime | 3.8~270(不知道为什么) |
 
-* 关于误差
+* 关于误差</br>
 对pth onnx engine三个模型都进行了测试，gaze部分，pth和engine基本一致，误差在小数点后第三位，但是landmarks部分误差较大，在小数点后第二位，onnx与engine也有一定误差，基本也在小数点后第二位，并且很奇怪的是，pth模型和onnx模型推理的结果也有一定误差，在小数点后第二位，令人不解
 
 ## Reference resources
